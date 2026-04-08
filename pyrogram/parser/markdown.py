@@ -1,0 +1,380 @@
+#  Pyrogram - Telegram MTProto API Client Library for Python
+#  Copyright (C) 2017-2024 Dan <https://github.com/delivrance>
+#  Copyright (C) 2026-present <https://github.com/TelegramPlayGround>
+#
+#  This file is part of Pyrogram.
+#
+#  Pyrogram is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU Lesser General Public License as published
+#  by the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  Pyrogram is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#  GNU Lesser General Public License for more details.
+#
+#  You should have received a copy of the GNU Lesser General Public License
+#  along with Pyrogram.  If not, see <http://www.gnu.org/licenses/>.
+
+import html
+import re
+import urllib.parse
+
+from typing import Optional, Union
+
+import pyrogram
+from pyrogram.enums import MessageEntityType
+
+from . import utils
+from .html import HTML
+
+BOLD_DELIM = "**"
+ITALIC_DELIM = "__"
+UNDERLINE_DELIM = "--"
+STRIKE_DELIM = "~~"
+SPOILER_DELIM = "||"
+CODE_DELIM = "`"
+PRE_DELIM = "```"
+BLOCKQUOTE_DELIM = ">"
+BLOCKQUOTE_ESCAPE_DELIM = "|>"
+BLOCKQUOTE_EXPANDABLE_DELIM = "**>"
+BLOCKQUOTE_EXPANDABLE_OPTIONAL_END_DELIM = "<**"
+
+MARKDOWN_RE = re.compile(
+    r"({d})|(!?)\[(.+?)\]\((.+?)\)".format(
+        d="|".join(
+            [
+                "".join(i)
+                for i in [
+                    [rf"\{j}" for j in i]
+                    for i in [
+                        PRE_DELIM,
+                        CODE_DELIM,
+                        STRIKE_DELIM,
+                        UNDERLINE_DELIM,
+                        ITALIC_DELIM,
+                        BOLD_DELIM,
+                        SPOILER_DELIM,
+                    ]
+                ]
+            ]
+        )
+    )
+)
+
+OPENING_TAG = "<{}>"
+CLOSING_TAG = "</{}>"
+URL_MARKUP = '<a href="{}">{}</a>'
+EMOJI_MARKUP = "<tg-emoji emoji-id={}>{}</tg-emoji>"
+DATE_TIME_MARKUP = "<tg-time unix={}>{}</tg-time>"
+DATE_TIME_FORMAT_MARKUP = "<tg-time unix={} format={}>{}</tg-time>"
+FIXED_WIDTH_DELIMS = [CODE_DELIM, PRE_DELIM]
+CODE_TAG_RE = re.compile(r"<code>.*?</code>")
+URL_RE = re.compile(r"(!?)\[(.+?)\]\((.+?)\)")
+
+
+class Markdown:
+    def __init__(self, client: Optional["pyrogram.Client"]):
+        self.html = HTML(client)
+
+    @staticmethod
+    def escape_and_create_quotes(text: str, strict: bool):
+        text_lines: list[Union[str, None]] = text.splitlines()
+
+        # Indexes of Already escaped lines
+        html_escaped_list: list[int] = []
+
+        # Temporary Queue to hold lines to be quoted
+        # Index and Line
+        to_quote_list: list[tuple[int, str]] = []
+
+        def create_blockquote(quote_type: str = "") -> None:
+            """
+            Merges all lines in quote_queue into first line of queue
+            Encloses that line in html quote
+            Replaces rest of the lines with None placeholders to preserve indexes
+            """
+            if len(to_quote_list) == 0:
+                return
+
+            # Create quoted text block
+            joined_lines = "\n".join([text for _, text in to_quote_list])
+
+            first_line_index, _ = to_quote_list[0]
+
+            # Enclose the block in html quote
+            # and add to starting index of quoted line
+            text_lines[first_line_index] = f"<blockquote{quote_type}>{joined_lines}</blockquote>"
+
+            # Set None Placeholders for preserving indexes
+            for idx, line_to_remove in to_quote_list[1:]:
+                text_lines[idx] = None
+
+            # clear queue
+            to_quote_list.clear()
+
+        def process_text(start_delimiter, end_delimiter: str = "", quote_type: str = ""):
+            for index, line in enumerate(text_lines):
+                # Ignore None placeholders from previous runs
+                if line is None:
+                    continue
+
+                # Ignore Escaped >
+                if line.startswith(BLOCKQUOTE_ESCAPE_DELIM):
+                    text_lines[index] = line[1:]
+                    create_blockquote(quote_type=quote_type)
+                    continue
+
+                # Parse lines starting with delimiter
+                if line.startswith(start_delimiter):
+                    endswith_delimiter = end_delimiter and line.endswith(end_delimiter)
+
+                    # Indexes to skip in line
+                    start_index = len(start_delimiter)
+                    end_index = end_index = len(line) - len(end_delimiter) if endswith_delimiter else len(line)
+
+                    # Strip delimiters
+                    delimiter_stripped_line = line[start_index:end_index]
+
+                    # Escape if strict
+                    parsed_line = html.escape(delimiter_stripped_line) if strict else delimiter_stripped_line
+                    
+                    # add to queue
+                    to_quote_list.append((index, parsed_line))
+
+                    # save line index
+                    html_escaped_list.append(index)
+
+                    # if line doesn't end with delimiter continue loop
+                    if not endswith_delimiter:
+                        continue
+
+                # If line doesn't start with a delimiter
+                # or has ended with delimiter
+                # it means the block quote has ended
+                # create pending quotes if any
+                create_blockquote(quote_type=quote_type)
+
+            else:
+                # is triggered when there's only one line of text
+                # the line above won't be triggered
+                # because loop will exit after first iteration
+                # so try to create quote if any in queue
+                create_blockquote(quote_type=quote_type)
+
+        process_text(
+            start_delimiter=BLOCKQUOTE_EXPANDABLE_DELIM,
+            end_delimiter=BLOCKQUOTE_EXPANDABLE_OPTIONAL_END_DELIM,
+            quote_type=" expandable",
+        )
+        process_text(start_delimiter=BLOCKQUOTE_DELIM)
+
+        if strict:
+            for idx, line in enumerate(text_lines):
+                if idx not in html_escaped_list:
+                    text_lines[idx] = html.escape(line)
+
+        return "\n".join(filter(lambda x: x is not None, text_lines))
+
+    async def parse(self, text: str, strict: bool = False):
+        text = self.escape_and_create_quotes(text, strict=strict)
+        delims = set()
+        is_fixed_width = False
+
+        for i, match in enumerate(re.finditer(MARKDOWN_RE, text)):
+            start, _ = match.span()
+            delim, is_emoji_or_date, text_url, url = match.groups()
+            full = match.group(0)
+
+            if delim in FIXED_WIDTH_DELIMS:
+                is_fixed_width = not is_fixed_width
+
+            if is_fixed_width and delim not in FIXED_WIDTH_DELIMS:
+                continue
+
+            if not is_emoji_or_date and text_url:
+                text = utils.replace_once(text, full, URL_MARKUP.format(url, text_url), start)
+                continue
+
+            if is_emoji_or_date:
+                emoji = text_url
+
+                parsed_url = urllib.parse.urlparse(url)
+                # Parse the query parameters into a dictionary-like object
+                query_params = urllib.parse.parse_qs(parsed_url.query)
+
+                # Branch 1: Custom Emoji
+                if parsed_url.netloc == "emoji":
+                    emoji_id = query_params.get("id", ["0"])[0]
+                    text = utils.replace_once(text, full, EMOJI_MARKUP.format(emoji_id, emoji), start)
+                
+                # Branch 2: Custom Time
+                elif parsed_url.netloc == "time":
+                    unix_time = query_params.get("unix", ["0"])[0]
+                    fmt_string = query_params.get("format", [""])[0]
+                    if fmt_string:
+                        text = utils.replace_once(text, full, DATE_TIME_FORMAT_MARKUP.format(unix_time, fmt_string, emoji), start)
+                    else:
+                        text = utils.replace_once(text, full, DATE_TIME_MARKUP.format(unix_time, emoji), start)
+                continue
+
+            if delim == BOLD_DELIM:
+                tag = "b"
+            elif delim == ITALIC_DELIM:
+                tag = "i"
+            elif delim == UNDERLINE_DELIM:
+                tag = "u"
+            elif delim == STRIKE_DELIM:
+                tag = "s"
+            elif delim == CODE_DELIM:
+                tag = "code"
+            elif delim == PRE_DELIM:
+                tag = "pre"
+            elif delim == SPOILER_DELIM:
+                tag = "spoiler"
+            else:
+                continue
+
+            if delim not in delims:
+                delims.add(delim)
+                tag = OPENING_TAG.format(tag)
+            else:
+                delims.remove(delim)
+                tag = CLOSING_TAG.format(tag)
+
+            if delim == PRE_DELIM and delim in delims:
+                delim_and_language = text[text.find(PRE_DELIM) :].split("\n")[0]
+                language = delim_and_language[len(PRE_DELIM) :]
+                text = utils.replace_once(
+                    text, delim_and_language, f'<pre language="{language}">', start
+                )
+                continue
+
+            text = utils.replace_once(text, delim, tag, start)
+
+        return await self.html.parse(text)
+
+    @staticmethod
+    def unparse(text: str, entities: list):
+        """
+        https://github.com/LonamiWebs/Telethon/blob/141b620/telethon/extensions/markdown.py#L137-L193
+
+        Performs the reverse operation to .parse(), effectively returning
+        markdown-like syntax given a normal text and its MessageEntity's.
+
+        :param text: the text to be reconverted into markdown.
+        :param entities: list of MessageEntity's applied to the text.
+        :return: a markdown-like text representing the combination of both inputs.
+        """
+        delimiters = {
+            MessageEntityType.BOLD: BOLD_DELIM,
+            MessageEntityType.ITALIC: ITALIC_DELIM,
+            MessageEntityType.UNDERLINE: UNDERLINE_DELIM,
+            MessageEntityType.STRIKETHROUGH: STRIKE_DELIM,
+            MessageEntityType.CODE: CODE_DELIM,
+            MessageEntityType.PRE: PRE_DELIM,
+            MessageEntityType.BLOCKQUOTE: BLOCKQUOTE_DELIM,
+            MessageEntityType.EXPANDABLE_BLOCKQUOTE: BLOCKQUOTE_EXPANDABLE_DELIM,
+            MessageEntityType.SPOILER: SPOILER_DELIM,
+        }
+
+        text = utils.add_surrogates(text)
+
+        insert_at = []
+        for i, entity in enumerate(entities):
+            s = entity.offset
+            e = entity.offset + entity.length
+            delimiter = delimiters.get(entity.type, None)
+            if delimiter:
+                if entity.type == MessageEntityType.PRE:
+                    inside_blockquote = any(
+                        blk_entity.offset <= s < blk_entity.offset + blk_entity.length
+                        and blk_entity.offset < e <= blk_entity.offset + blk_entity.length
+                        for blk_entity in entities
+                        if blk_entity.type == MessageEntityType.BLOCKQUOTE
+                    )
+                    is_expandable = any(
+                        blk_entity.offset <= s < blk_entity.offset + blk_entity.length
+                        and blk_entity.offset < e <= blk_entity.offset + blk_entity.length
+                        # and blk_entity.collapsed
+                        for blk_entity in entities
+                        if blk_entity.type == MessageEntityType.EXPANDABLE_BLOCKQUOTE
+                    )
+                    if inside_blockquote:
+                        if is_expandable:
+                            if entity.language:
+                                open_delimiter = f"{delimiter}{entity.language}\n**>"
+                            else:
+                                open_delimiter = f"{delimiter}\n**>"
+                            close_delimiter = f"\n**>{delimiter}"
+                        else:
+                            if entity.language:
+                                open_delimiter = f"{delimiter}{entity.language}\n>"
+                            else:
+                                open_delimiter = f"{delimiter}\n>"
+                            close_delimiter = f"\n>{delimiter}"
+                    else:
+                        if entity.language:
+                            open_delimiter = f"{delimiter}{entity.language}\n"
+                        else:
+                            open_delimiter = f"{delimiter}\n"
+                        close_delimiter = delimiter
+                    insert_at.append((s, i, open_delimiter))
+                    insert_at.append((e, -i, close_delimiter))
+                elif (
+                    entity.type != MessageEntityType.BLOCKQUOTE
+                    and entity.type != MessageEntityType.EXPANDABLE_BLOCKQUOTE
+                ):
+                    open_delimiter = delimiter
+                    close_delimiter = delimiter
+                    insert_at.append((s, i, open_delimiter))
+                    insert_at.append((e, -i, close_delimiter))
+                else:
+                    # Handle multiline blockquotes
+                    text_subset = text[s:e]
+                    lines = text_subset.splitlines()
+                    for line_num, line in enumerate(lines):
+                        line_start = s + sum(len(l) + 1 for l in lines[:line_num])
+                        if entity.type == MessageEntityType.EXPANDABLE_BLOCKQUOTE:
+                            insert_at.append((line_start, i, BLOCKQUOTE_EXPANDABLE_DELIM))
+                        else:
+                            insert_at.append((line_start, i, BLOCKQUOTE_DELIM))
+            # No closing delimiter for blockquotes
+            else:
+                url = None
+                is_emoji_or_date = False
+                if entity.type == MessageEntityType.TEXT_LINK:
+                    url = entity.url
+                elif entity.type == MessageEntityType.TEXT_MENTION:
+                    url = f"tg://user?id={entity.user.id}"
+                elif entity.type == MessageEntityType.CUSTOM_EMOJI:
+                    url = f"tg://emoji?id={entity.custom_emoji_id}"
+                    is_emoji_or_date = True
+                elif entity.type == MessageEntityType.DATE_TIME:
+                    if entity.date_time_format:
+                        url = f"tg://time?unix={entity.unix_time}&format={entity.date_time_format}"
+                    else:
+                        url = f"tg://time?unix={entity.unix_time}"
+                    is_emoji_or_date = True
+                if url:
+                    if is_emoji_or_date:
+                        insert_at.append((s, i, "!["))
+                    else:
+                        insert_at.append((s, i, "["))
+                    insert_at.append((e, -i, f"]({url})"))
+
+        insert_at.sort(key=lambda t: (t[0], t[1]))
+        while insert_at:
+            at, _, what = insert_at.pop()
+
+            # If we are in the middle of a surrogate nudge the position by -1.
+            # Otherwise we would end up with malformed text and fail to encode.
+            # For example of bad input: "Hi \ud83d\ude1c"
+            # https://en.wikipedia.org/wiki/UTF-16#U+010000_to_U+10FFFF
+            while utils.within_surrogate(text, at):
+                at += 1
+
+            text = text[:at] + what + text[at:]
+
+        return utils.remove_surrogates(text)
